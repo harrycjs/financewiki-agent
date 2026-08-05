@@ -142,80 +142,146 @@ async def document_handler(task: dict):
     print(f"✅ 文档处理完成: {doc_id}")
 
 
-def chunk_document(content: str, max_paragraph_len: int = 500, max_sentence_len: int = 200) -> list:
-    """文档切分：段落+句子双粒度，确保不丢任何尾部内容
+def chunk_document(content: str, max_chunk_len: int = 600, similarity_threshold: float = 0.55, window: int = 3) -> list:
+    """语义分块：滑动窗口 + 相似度落差检测
 
     切分策略：
-    1. 按段落（\\n\\n）粗切：短段落直接成 chunk；
-    2. 长段落按中英文句末标点细切：累积成 <= max_sentence_len 的 chunk；
-    3. 单句/无标点长段若仍超过 max_sentence_len，按字符硬切（确保覆盖末尾）；
-    4. 末尾 current_chunk 必须 flush，绝不丢弃。
+    1. 句子级切分（中英文句末标点）
+    2. 批量 embedding（复用 cache）
+    3. 计算相邻句子的局部平均相似度（窗口平滑）
+    4. 相似度骤降处 = 语义边界
+    5. 兜底：单 chunk 超长时按字符硬切，保证不丢尾部
+
+    参数：
+      max_chunk_len        单片硬上限（适配 embedding 模型 token 限制）
+      similarity_threshold 相似度低于此值视为切点（0~1，越大切得越细）
+      window               滑动窗口大小（句数，越大越平滑）
     """
     import re
     import uuid
+    import asyncio
 
-    chunks = []
-
+    # 工具函数：硬切（兜底用）
     def _hard_split(text: str, limit: int) -> list:
-        """单段文本超过 limit 时按字符硬切，最后一片可小于 limit 但非空"""
         if len(text) <= limit:
             return [text]
-        parts = []
-        for i in range(0, len(text), limit):
-            seg = text[i:i + limit]
-            if seg:
-                parts.append(seg)
-        return parts
+        return [text[i:i+limit] for i in range(0, len(text), limit) if text[i:i+limit]]
 
-    # 按段落切分
-    paragraphs = content.split("\n\n")
+    # 工具函数：把 chunk 包成 dict
+    def _wrap(content: str) -> dict:
+        return {
+            "id": str(uuid.uuid4()),
+            "type": "semantic",
+            "content": content,
+            "metadata": {"level": "semantic", "split_method": "cosine_drop"}
+        }
 
-    for para in paragraphs:
-        para = para.strip()
-        if not para:
-            continue
+    # 短文本直接返回
+    text = content.strip()
+    if len(text) <= max_chunk_len:
+        return [_wrap(text)] if text else []
 
-        if len(para) <= max_paragraph_len:
-            # 段落足够短，直接作为chunk（仍按硬切兜底，保证单片不超 max_sentence_len）
-            for seg in _hard_split(para, max_sentence_len):
-                chunks.append({
-                    "id": str(uuid.uuid4()),
-                    "type": "paragraph",
-                    "content": seg,
-                    "metadata": {"level": "paragraph"}
-                })
+    # 1. 句子级切分（中英文句末标点 + 换行）
+    raw_sentences = re.split(r'(?<=[。！？；\n.!?])\s*', text)
+    sentences = [s.strip() for s in raw_sentences if s.strip()]
+
+    # 2. 太短（句子数 < 窗口+1）不切
+    if len(sentences) <= window + 1:
+        return _hard_split(text, max_chunk_len) and [_wrap(c) for c in _hard_split(text, max_chunk_len)] or []
+
+    # 3. 同步包一层：让旧的同步调用也能跑（不依赖外部异步上下文时）
+    return _semantic_chunk_sync(
+        sentences, max_chunk_len, similarity_threshold, window, _hard_split, _wrap
+    )
+
+
+def _semantic_chunk_sync(sentences, max_chunk_len, threshold, window, _hard_split, _wrap):
+    """同步入口：跑异步 embedding 计算"""
+    import asyncio
+    try:
+        # 看是否已有事件循环
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # 已经在异步上下文里：构造任务跑不动，退化为窗口级硬切
+            return _fallback_chunk(sentences, max_chunk_len, _hard_split, _wrap)
         else:
-            # 段落过长，按句子切分
-            sentences = re.split(r'([。！？；\n])', para)
-            current_chunk = ""
+            return loop.run_until_complete(_semantic_chunk_async(
+                sentences, max_chunk_len, threshold, window, _hard_split, _wrap
+            ))
+    except RuntimeError:
+        # 没有事件循环 → 新建一个
+        return asyncio.run(_semantic_chunk_async(
+            sentences, max_chunk_len, threshold, window, _hard_split, _wrap
+        ))
 
-            def _flush(buf: str):
-                """把累积缓冲按硬切切成 chunk，保证不丢"""
-                if not buf.strip():
-                    return
-                for seg in _hard_split(buf.strip(), max_sentence_len):
-                    chunks.append({
-                        "id": str(uuid.uuid4()),
-                        "type": "sentence",
-                        "content": seg,
-                        "metadata": {"level": "sentence"}
-                    })
 
-            for sent in sentences:
-                # 单句本身就比 max_sentence_len 长：单独 flush，再把这一长句硬切
-                if len(sent) > max_sentence_len:
-                    _flush(current_chunk)
-                    current_chunk = ""
-                    _flush(sent)  # _hard_split 内部保证完整覆盖
-                    continue
+async def _semantic_chunk_async(sentences, max_chunk_len, threshold, window, _hard_split, _wrap):
+    """异步核心：批量 embedding + 找相似度落差"""
+    import numpy as np
+    from ..core.embedding.embedding_service import EmbeddingService
 
-                if len(current_chunk) + len(sent) <= max_sentence_len:
-                    current_chunk += sent
-                else:
-                    _flush(current_chunk)
-                    current_chunk = sent
+    # 1. 批量 embedding（带缓存）
+    es = EmbeddingService()
+    embs = await es.embed_batch(sentences)
+    # embs 是 list[list[float]]，转 numpy 加速计算
+    embs_arr = np.array(embs, dtype=np.float32)  # (N, dim)
 
-            # 末尾必须 flush，绝不丢弃尾部
-            _flush(current_chunk)
+    # 2. 计算相邻 N 句的局部平均余弦相似度
+    n = len(sentences)
+    sims = []
+    for i in range(n - 1):
+        # 跟 [i-window, i+window] 范围（不含自身）的句子算相似度
+        neighbors = []
+        for j in range(max(0, i - window), min(n, i + window + 1)):
+            if j != i:
+                a = embs_arr[i]
+                b = embs_arr[j]
+                norm = np.linalg.norm(a) * np.linalg.norm(b)
+                if norm > 0:
+                    neighbors.append(float(np.dot(a, b) / norm))
+        sims.append(sum(neighbors) / len(neighbors) if neighbors else 1.0)
 
-    return chunks
+    # 3. 找切点（相似度 < threshold）
+    chunks_text: list = []
+    current = [sentences[0]]
+    for i, sim in enumerate(sims):
+        if sim < threshold:
+            chunks_text.append("".join(current))
+            current = []
+        current.append(sentences[i + 1])
+    if current:
+        chunks_text.append("".join(current))
+
+    # 4. 兜底：任何超长 chunk 按 max_chunk_len 硬切
+    final_chunks = []
+    for c in chunks_text:
+        if len(c) > max_chunk_len:
+            final_chunks.extend(_hard_split(c, max_chunk_len))
+        else:
+            final_chunks.append(c)
+
+    return [_wrap(c) for c in final_chunks]
+
+
+def _fallback_chunk(sentences, max_chunk_len, _hard_split, _wrap):
+    """降级方案：在已有事件循环里跑不了嵌套 loop 时，按简单句子级累计"""
+    chunks_text: list = []
+    current = ""
+    for s in sentences:
+        if len(current) + len(s) > max_chunk_len:
+            if current:
+                chunks_text.append(current)
+            current = s
+        else:
+            current += s
+    if current:
+        chunks_text.append(current)
+
+    # 任何超长硬切
+    final = []
+    for c in chunks_text:
+        if len(c) > max_chunk_len:
+            final.extend(_hard_split(c, max_chunk_len))
+        else:
+            final.append(c)
+    return [_wrap(c) for c in final]
