@@ -104,9 +104,13 @@ class CacheService:
                 "expire": datetime.now() + timedelta(seconds=self.embedding_ttl)
             }
         else:
-            # 转换为numpy数组再保存
+            # ★ 修复：写入时强制 float32，与读取端 dtype 保持一致
+            # 否则 np.array(list) 默认 float64 → tobytes() 8 字节/元素
+            # 读取时 np.frombuffer(..., float32) 4 字节/元素 → 维度翻倍
             if not isinstance(embedding, np.ndarray):
-                embedding = np.array(embedding)
+                embedding = np.array(embedding, dtype=np.float32)
+            elif embedding.dtype != np.float32:
+                embedding = embedding.astype(np.float32)
             await self.redis.setex(cache_key, self.embedding_ttl, embedding.tobytes())
 
     async def get_session_context(self, session_id: str):
