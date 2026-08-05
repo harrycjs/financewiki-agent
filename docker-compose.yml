@@ -1,0 +1,55 @@
+version: '3.8'
+
+services:
+  # Qdrant向量数据库
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: finance-agent-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      - QDRANT__SERVICE__GRPC_PORT=6334
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Redis缓存和队列
+  redis:
+    image: redis:7-alpine
+    container_name: finance-agent-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # 后端服务 (可选，也可以直接运行Python)
+  # backend:
+  #   build: .
+  #   ports:
+  #     - "8000:8000"
+  #   environment:
+  #     - DEEPSEEK_API_KEY=sk-fd4df3956bb54948a969b7e7b0056997
+  #     - DEEPSEEK_API_BASE=https://api.deepseek.com
+  #   depends_on:
+  #     - qdrant
+  #     - redis
+  #   restart: unless-stopped
+
+volumes:
+  qdrant_data:
+    driver: local
+  redis_data:
+    driver: local

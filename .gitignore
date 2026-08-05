@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# 数据目录
+data/
+!data/.gitkeep
+
+# 日志
+logs/
+*.log
+
+# 环境变量
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# Node
+node_modules/
+frontend/dist/
+
+# 模型文件
+*.bin
+*.pt
+*.pth
+
+# 测试 / 临时
+test/
+*.tmp
+create_skill.json
+test_skill*.json
+
+# codewiki 工具状态
+.codewiki/
+frontend/.codewiki/
+
+# 第三方 skill（独立许可证，不在项目范围）
+backend/skills/pdf/
+
+# Qdrant / 服务标记文件
+.qdrant-initialized
+*.qdrant-*
