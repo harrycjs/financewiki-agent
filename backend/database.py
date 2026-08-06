@@ -98,11 +98,67 @@ def init_database():
             )
         """)
 
+        # ==================== 记忆系统 ====================
+
+        # 短期记忆摘要（主存 Redis，此表为兜底 / 可审计副本）
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS short_term_summaries (
+                session_id TEXT PRIMARY KEY,
+                summary TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # 中期记忆：跨会话历史问答原文（向量索引在 Qdrant chat_memory）
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS mid_term_qa (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                user_msg TEXT NOT NULL,
+                ai_msg TEXT NOT NULL,
+                sources TEXT,
+                embedding_id TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # 长期记忆：LLM 抽取的结构化事实（embedding 以 JSON 存 blob 列）
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS long_term_facts (
+                id TEXT PRIMARY KEY,
+                session_id TEXT,
+                fact TEXT NOT NULL,
+                category TEXT NOT NULL,
+                confidence REAL DEFAULT 0.5,
+                embedding_blob TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # 压缩事件审计：观测 80% 阈值触发频率与压缩收益
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS compression_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                pre_tokens INTEGER NOT NULL,
+                post_tokens INTEGER NOT NULL,
+                compressed_turns INTEGER NOT NULL,
+                trigger TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         # 创建索引
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_entities_doc_id ON entities(doc_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_relations_doc_id ON relations(doc_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_chat_history_session ON chat_history(session_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_chat_history_created ON chat_history(created_at)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_mid_term_session ON mid_term_qa(session_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_mid_term_created ON mid_term_qa(created_at)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_long_term_category ON long_term_facts(category)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_long_term_updated ON long_term_facts(updated_at)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_compression_session ON compression_events(session_id)")
 
         conn.commit()
         print(f"✅ 数据库初始化完成: {db_path}")
@@ -134,3 +190,12 @@ def execute_many(query: str, params_list: list):
         cursor = conn.cursor()
         cursor.executemany(query, params_list)
         conn.commit()
+
+
+def execute_update(query: str, params: tuple = ()) -> int:
+    """执行 INSERT/UPDATE/DELETE，返回受影响行数"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(query, params)
+        conn.commit()
+        return cursor.rowcount

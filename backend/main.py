@@ -28,6 +28,18 @@ async def lifespan(app: FastAPI):
     vector_store = QdrantVectorStore()
     await vector_store.init_collection()
 
+    # 初始化三层记忆（Redis 探测 + Qdrant chat_memory collection + 长期抽取 LLM 能力）
+    from .core.memory import get_memory_manager
+    await get_memory_manager().init()
+
+    # 预热 embedding 模型：长期/中期记忆抽取依赖它，避免首次用户请求时冷启动卡顿
+    try:
+        from .core.rag.embedding_service import EmbeddingService
+        EmbeddingService()._load_local_model()
+        print("✅ Embedding 模型已预热")
+    except Exception as e:
+        print(f"⚠️ Embedding 模型预热失败（仍可用，长期/中期抽取将降级）: {e}")
+
     # 加载知识图谱
     from .core.knowledge_graph.builder import KnowledgeGraphBuilder
     kg_builder = KnowledgeGraphBuilder()

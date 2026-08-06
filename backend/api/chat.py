@@ -74,12 +74,34 @@ def _ensure_session_row(session_id: str, model: str, first_message: str = None):
         conn.commit()
 
 
+def _write_chat_history(session_id: str, user_msg: str, ai_msg: str, sources: list):
+    """把一轮对话写入 chat_history（SQLite 是记忆的 source of truth）"""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """INSERT INTO chat_history (session_id, role, content, sources)
+               VALUES (?, ?, ?, ?)""",
+            (session_id, "user", user_msg, json.dumps([]))
+        )
+        cursor.execute(
+            """INSERT INTO chat_history (session_id, role, content, sources)
+               VALUES (?, ?, ?, ?)""",
+            (session_id, "assistant", ai_msg, json.dumps(sources or []))
+        )
+        # 再次刷新 updated_at，使列表按最近活跃排序
+        cursor.execute(
+            "UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (session_id,)
+        )
+        conn.commit()
+
+
 @router.post("")
 async def chat(request: ChatRequest):
     """发送消息，获取AI回复"""
     from ..core.rag.retriever import TripleRetriever
     from ..core.rag.generator import ResponseGenerator
-    from ..core.memory.short_term import ShortTermMemory
+    from ..core.memory import get_memory_manager
     from ..core.cache.cache_service import CacheService
 
     # 获取或创建会话
@@ -89,9 +111,8 @@ async def chat(request: ChatRequest):
     # ★ 修复：每次 /api/chat 都确保 sessions 表里有对应行
     _ensure_session_row(session_id, model_name, first_message=request.message)
 
-    # 获取短期记忆上下文
-    short_term = ShortTermMemory()
-    context = await short_term.get_context(session_id)
+    # 三层记忆统一入口（单例，持有唯一的 Redis 连接与向量库实例）
+    memory = get_memory_manager()
 
     # 检查缓存（cache key 加入 skills_sig，技能切换自动失效）
     cache = CacheService()
@@ -105,12 +126,22 @@ async def chat(request: ChatRequest):
     )
 
     if cached_result:
-        # 缓存命中，直接返回
+        # 缓存命中也必须落历史与记忆，否则同一问题问第二次会话就断了
+        answer = cached_result["answer"]
+        sources = cached_result.get("sources", [])
+        _write_chat_history(session_id, request.message, answer, sources)
+        memory.schedule_write(session_id, request.message, answer, sources)
+
         async def cached_stream():
             yield json.dumps({
+                "type": "session_id",
+                "session_id": session_id
+            })
+            yield "\n"
+            yield json.dumps({
                 "type": "content",
-                "content": cached_result["answer"],
-                "sources": cached_result.get("sources", [])
+                "content": answer,
+                "sources": sources
             })
             yield "\n"
 
@@ -120,16 +151,18 @@ async def chat(request: ChatRequest):
     retriever = TripleRetriever()
     results = await retriever.retrieve(request.message, request.top_k)
 
+    # 组装三层记忆上下文（内含 95% 安全阀同步压缩）
+    context_block = await memory.assemble_context(session_id, request.message)
+
     # 生成回答
     generator = ResponseGenerator()
     answer = await generator.generate(
         query=request.message,
-        context=context,
+        context=context_block,
         documents=results
     )
 
-    # 保存到短期记忆
-    await short_term.add(session_id, request.message, answer)
+    sources = [r.get("id") for r in results if r.get("id")]
 
     # 缓存结果
     await cache.set_query_cache(
@@ -138,31 +171,16 @@ async def chat(request: ChatRequest):
         request.top_k,
         {
             "answer": answer,
-            "sources": [r.get("id") for r in results if r.get("id")]
+            "sources": sources
         },
         skills_sig
     )
 
-    # 保存到数据库
-    with get_db() as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            """INSERT INTO chat_history (session_id, role, content, sources)
-               VALUES (?, ?, ?, ?)""",
-            (session_id, "user", request.message, json.dumps([]))
-        )
-        cursor.execute(
-            """INSERT INTO chat_history (session_id, role, content, sources)
-               VALUES (?, ?, ?, ?)""",
-            (session_id, "assistant", answer,
-             json.dumps([r.get("id") for r in results if r.get("id")]))
-        )
-        # 再次刷新 updated_at，使列表按最近活跃排序
-        cursor.execute(
-            "UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (session_id,)
-        )
-        conn.commit()
+    # 保存到数据库（source of truth，同步写）
+    _write_chat_history(session_id, request.message, answer, sources)
+
+    # 三层记忆写入 + 80% 后台压缩检查，fire-and-forget 不阻塞回复
+    memory.schedule_write(session_id, request.message, answer, sources)
 
     # 流式输出
     async def stream_response():
@@ -174,7 +192,7 @@ async def chat(request: ChatRequest):
         yield json.dumps({
             "type": "content",
             "content": answer,
-            "sources": [r.get("id") for r in results if r.get("id")]
+            "sources": sources
         })
         yield "\n"
 
@@ -311,10 +329,21 @@ async def create_session(request: SessionCreate):
 
 @router.delete("/sessions/{session_id}")
 async def delete_session(session_id: str):
-    """删除会话"""
+    """删除会话：DB + 三层记忆（短期/中期）一并清理"""
+    from ..core.memory import get_memory_manager
+    memory = get_memory_manager()
+    await memory.forget_session(session_id)
     with get_db() as conn:
         cursor = conn.cursor()
         cursor.execute("DELETE FROM chat_history WHERE session_id = ?", (session_id,))
         cursor.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
         conn.commit()
     return {"message": "会话已删除"}
+
+
+@router.get("/memory/stats")
+async def memory_stats(session_id: Optional[str] = None):
+    """三层记忆运行状态（用于观测）"""
+    from ..core.memory import get_memory_manager
+    memory = get_memory_manager()
+    return await memory.stats(session_id)

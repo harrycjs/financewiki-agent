@@ -11,8 +11,8 @@ from ...config import settings
 class QdrantVectorStore:
     """向量数据库封装 - 支持Qdrant和内存模式"""
 
-    def __init__(self):
-        self.collection_name = "finance_docs"
+    def __init__(self, collection_name: Optional[str] = None):
+        self.collection_name = collection_name or "finance_docs"
         self.vector_size = settings.EMBEDDING_DIMENSION
         self.vectors = {}  # 内存存储
         self.client = None

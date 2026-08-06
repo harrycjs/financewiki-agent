@@ -59,6 +59,32 @@ class Settings(BaseSettings):
     # 默认模型
     DEFAULT_MODEL: str = "deepseek"
 
+    # ==================== 记忆系统 ====================
+    # 短期记忆：当前会话原文窗口（Redis，SQLite 兜底回填）
+    MEMORY_SHORT_TERM_TTL: int = 86400          # 24小时；miss 时从 chat_history 回填
+    MEMORY_SHORT_TERM_ANCHOR_RENDER: int = 0    # 0 = 渲染全部锚点原文；>0 只渲染最近 N 条
+
+    # 中期记忆：跨会话历史问答向量召回
+    MEMORY_MID_TERM_COLLECTION: str = "chat_memory"
+    MEMORY_MID_TERM_TOP_K: int = 5
+    MEMORY_MID_TERM_SCORE_THRESHOLD: float = 0.6
+    MEMORY_MID_TERM_SNIPPET_CHARS: int = 150
+
+    # 长期记忆：LLM 抽取的结构化事实
+    MEMORY_LONG_TERM_TOP_K: int = 5
+    MEMORY_LONG_TERM_SCORE_THRESHOLD: float = 0.5
+    MEMORY_LONG_TERM_DEDUP_THRESHOLD: float = 0.92   # 余弦相似度超过则合并而非新增
+    MEMORY_LONG_TERM_SNIPPET_CHARS: int = 100
+    MEMORY_ENABLE_LONG_TERM_EXTRACT: bool = True     # 出问题可一键关闭 LLM 抽取
+
+    # ==================== 上下文压缩 ====================
+    COMPRESSION_CONTEXT_WINDOW: int = 200_000    # 统一上下文窗口
+    COMPRESSION_TRIGGER_RATIO: float = 0.8       # 后台主通道触发线
+    COMPRESSION_HARD_RATIO: float = 0.95         # 请求路径同步安全阀
+    COMPRESSION_ANCHOR_RECENT_TURNS: int = 3     # 保留最近 N 轮原文不压缩
+    COMPRESSION_SUMMARY_MAX_TOKENS: int = 2000
+    COMPRESSION_LLM_TEMPERATURE: float = 0.2
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

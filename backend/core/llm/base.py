@@ -268,3 +268,27 @@ class MiniMaxLLM(BaseLLM):
                                 yield delta["content"]
                         except json.JSONDecodeError:
                             continue
+
+
+def get_active_llm() -> BaseLLM:
+    """获取当前激活的 LLM 实例。
+
+    与 ResponseGenerator._get_llm / TripleRetriever._get_llm 行为一致：优先读
+    model_configs 表里 is_active=1 的配置，没有则回退到 settings 里的 DeepSeek。
+    抽成模块级函数供记忆系统（摘要压缩、长期事实抽取）复用。
+    """
+    from ...database import execute_query
+
+    try:
+        rows = execute_query(
+            "SELECT provider, api_key, api_base FROM model_configs WHERE is_active = 1"
+        )
+        if rows:
+            provider, api_key, api_base = rows[0]
+            return BaseLLM.create(provider, api_key, api_base)
+    except Exception as e:
+        print(f"⚠️ 读取激活模型配置失败，回退 DeepSeek: {e}")
+
+    return BaseLLM.create(
+        "deepseek", settings.DEEPSEEK_API_KEY, settings.DEEPSEEK_API_BASE
+    )
