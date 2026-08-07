@@ -49,6 +49,20 @@
             <el-avatar v-else :size="36" style="background: #1890ff">AI</el-avatar>
           </div>
           <div class="message-content">
+            <div v-if="msg.tools && msg.tools.length > 0" class="message-tools">
+              <el-tag
+                v-for="(tool, ti) in msg.tools"
+                :key="ti"
+                size="small"
+                :type="tool.status === 'failed' ? 'danger' : (tool.status === 'done' ? 'success' : 'warning')"
+                effect="plain"
+                class="tool-chip"
+              >
+                <el-icon v-if="tool.status === 'running'" class="is-loading"><Loading /></el-icon>
+                {{ tool.name }}
+                <span v-if="tool.arguments" class="tool-arg">{{ summarizeArgs(tool.arguments) }}</span>
+              </el-tag>
+            </div>
             <div class="message-text" v-html="renderMarkdown(msg.content)"></div>
             <div v-if="msg.sources && msg.sources.length > 0" class="message-sources">
               <el-tag size="small" type="info" v-for="source in msg.sources" :key="source">
@@ -57,7 +71,7 @@
             </div>
           </div>
         </div>
-        <div v-if="loading" class="message assistant">
+        <div v-if="loading && !streaming" class="message assistant">
           <div class="message-avatar">
             <el-avatar :size="36" style="background: #1890ff">AI</el-avatar>
           </div>
@@ -110,13 +124,13 @@
 <script setup>
 import { ref, onMounted, nextTick, watch } from 'vue'
 import { storeToRefs } from 'pinia'
-import { Plus, Delete, ChatDotRound, Promotion } from '@element-plus/icons-vue'
+import { Plus, Delete, ChatDotRound, Promotion, Loading } from '@element-plus/icons-vue'
 import { useChatStore } from '../stores/chat'
 import { marked } from 'marked'
 import axios from 'axios'
 
 const chatStore = useChatStore()
-const { sessions, currentSession, messages, loading } = storeToRefs(chatStore)
+const { sessions, currentSession, messages, loading, streaming } = storeToRefs(chatStore)
 
 const inputMessage = ref('')
 const selectedModel = ref('deepseek')
@@ -171,6 +185,15 @@ async function sendMessage() {
 function renderMarkdown(text) {
   if (!text) return ''
   return marked.parse(text)
+}
+
+// 工具参数在气泡上只展示一小段，完整参数没必要占版面
+function summarizeArgs(args) {
+  if (!args || typeof args !== 'object') return ''
+  const primary = args.command ?? args.query ?? args.path
+  if (!primary) return ''
+  const text = String(primary)
+  return text.length > 40 ? `: ${text.slice(0, 40)}…` : `: ${text}`
 }
 
 function formatTime(time) {
@@ -329,6 +352,22 @@ function formatTime(time) {
   display: flex;
   flex-wrap: wrap;
   gap: 4px;
+}
+
+.message-tools {
+  margin-bottom: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.tool-chip {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+.tool-arg {
+  opacity: 0.7;
 }
 
 .typing-indicator {

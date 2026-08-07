@@ -34,7 +34,7 @@ async def lifespan(app: FastAPI):
 
     # 预热 embedding 模型：长期/中期记忆抽取依赖它，避免首次用户请求时冷启动卡顿
     try:
-        from .core.rag.embedding_service import EmbeddingService
+        from .core.embedding.embedding_service import EmbeddingService
         EmbeddingService()._load_local_model()
         print("✅ Embedding 模型已预热")
     except Exception as e:

@@ -163,13 +163,28 @@ class SkillScanner:
             if not skill_md.exists():
                 continue
             try:
-                meta, _ = parse_skill_md(skill_md.read_text(encoding="utf-8"))
+                meta, _ = parse_skill_md(self._read_text(skill_md))
                 meta.setdefault("name", entry.name)
                 meta["path"] = str(skill_md)
                 meta["is_preset"] = entry.name in PRESET_SKILLS
                 self._cache[entry.name] = meta
             except Exception as e:
                 print(f"⚠️ 解析技能失败 {entry.name}: {e}")
+
+    @staticmethod
+    def _read_text(path: Path) -> str:
+        """读文本文件：先 UTF-8，失败回退 GBK
+
+        Windows 上很多脚本（含上游 skill-creator/scripts/init_skill.py）
+        用默认 encoding 写文件 → GBK，scanner 拿 UTF-8 读就崩。
+        """
+        raw = path.read_bytes()
+        for enc in ("utf-8", "gbk", "latin-1"):
+            try:
+                return raw.decode(enc)
+            except UnicodeDecodeError:
+                continue
+        return raw.decode("utf-8", errors="replace")
 
     def invalidate_cache(self):
         self._loaded = False
@@ -191,7 +206,7 @@ class SkillScanner:
         if not path.exists():
             return None
         try:
-            full_text = path.read_text(encoding="utf-8")
+            full_text = self._read_text(path)
             _, body = parse_skill_md(full_text)
             return {**meta, "body": body, "raw": full_text}
         except Exception:

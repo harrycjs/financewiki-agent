@@ -7,6 +7,8 @@ export const useChatStore = defineStore('chat', () => {
   const currentSession = ref(null)
   const messages = ref([])
   const loading = ref(false)
+  // 首个 delta 到达后置 true，用于让"正在输入"指示器让位给真正的流式内容
+  const streaming = ref(false)
 
   // 获取会话列表
   async function fetchSessions() {
@@ -36,6 +38,7 @@ export const useChatStore = defineStore('chat', () => {
   // 发送消息
   async function sendMessage(content, model = 'deepseek') {
     loading.value = true
+    streaming.value = false
 
     try {
       // 只 push 用户消息；助手消息等真正收到内容时再 push
@@ -64,51 +67,85 @@ export const useChatStore = defineStore('chat', () => {
       const decoder = new TextDecoder()
 
       let returnedSessionId = null
+      // 半行缓冲：delta 变小之后，一个 JSON 对象很容易被切在两个 chunk 中间，
+      // 必须把不完整的尾巴留到下一轮再拼。decode 也要开 stream:true，
+      // 否则中文的多字节序列跨 chunk 会解出乱码。
+      let buffer = ''
+
+      const ensureAssistant = () => {
+        const last = messages.value[messages.value.length - 1]
+        if (last && last.role === 'assistant' && last.__streaming) return last
+        const created = {
+          role: 'assistant',
+          content: '',
+          sources: [],
+          tools: [],
+          __streaming: true
+        }
+        messages.value.push(created)
+        return created
+      }
+
+      const handleEvent = (data) => {
+        if (data.type === 'session_id' && data.session_id) {
+          returnedSessionId = data.session_id
+          // ★ 修复：后端可能新建了会话，立即把 session 信息同步到本地 store
+          if (!currentSession.value || currentSession.value.id !== data.session_id) {
+            currentSession.value = {
+              id: data.session_id,
+              title: content.trim().replace(/\n/g, ' ').slice(0, 30) +
+                (content.trim().length > 30 ? '...' : ''),
+              model: model
+            }
+          }
+        } else if (data.type === 'delta') {
+          streaming.value = true
+          const msg = ensureAssistant()
+          msg.content += data.content
+          messages.value = [...messages.value]
+        } else if (data.type === 'tool_call') {
+          streaming.value = true
+          const msg = ensureAssistant()
+          msg.tools.push({ name: data.name, arguments: data.arguments, status: 'running' })
+          messages.value = [...messages.value]
+        } else if (data.type === 'tool_result') {
+          const msg = ensureAssistant()
+          const entry = [...msg.tools].reverse().find(t => t.name === data.name && t.status === 'running')
+          if (entry) {
+            entry.status = data.ok ? 'done' : 'failed'
+            entry.preview = data.preview
+          }
+          messages.value = [...messages.value]
+        } else if (data.type === 'done') {
+          const msg = ensureAssistant()
+          msg.sources = data.sources || []
+          messages.value = [...messages.value]
+        } else if (data.type === 'error') {
+          const msg = ensureAssistant()
+          msg.content += `\n\n> ⚠️ 生成中断：${data.message}`
+          messages.value = [...messages.value]
+        }
+      }
+
+      const drain = (line) => {
+        if (!line.trim()) return
+        try {
+          handleEvent(JSON.parse(line))
+        } catch (e) {
+          // 忽略解析错误
+        }
+      }
 
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
 
-        const chunk = decoder.decode(value)
-        const lines = chunk.split('\n').filter(line => line.trim())
-
-        for (const line of lines) {
-          try {
-            const data = JSON.parse(line)
-
-            if (data.type === 'session_id' && data.session_id) {
-              returnedSessionId = data.session_id
-              // ★ 修复：后端可能新建了会话，立即把 session 信息同步到本地 store
-              if (!currentSession.value || currentSession.value.id !== data.session_id) {
-                currentSession.value = {
-                  id: data.session_id,
-                  title: content.trim().replace(/\n/g, ' ').slice(0, 30) +
-                    (content.trim().length > 30 ? '...' : ''),
-                  model: model
-                }
-              }
-            } else if (data.type === 'content') {
-              // 第一段内容到达时 push 助手消息，之后追加
-              const last = messages.value[messages.value.length - 1]
-              if (last && last.role === 'assistant' && last.__streaming) {
-                // 已有流式占位，累加内容
-                last.content = data.content
-                messages.value = [...messages.value]
-              } else {
-                // 第一次内容到达，新建助手消息
-                messages.value.push({
-                  role: 'assistant',
-                  content: data.content,
-                  sources: data.sources || [],
-                  __streaming: true
-                })
-              }
-            }
-          } catch (e) {
-            // 忽略解析错误
-          }
-        }
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() ?? ''
+        for (const line of lines) drain(line)
       }
+      drain(buffer)
 
       // 流式结束：去掉 __streaming 标记
       const last = messages.value[messages.value.length - 1]
@@ -153,6 +190,7 @@ export const useChatStore = defineStore('chat', () => {
       })
     } finally {
       loading.value = false
+      streaming.value = false
     }
   }
 
@@ -187,6 +225,7 @@ export const useChatStore = defineStore('chat', () => {
     currentSession,
     messages,
     loading,
+    streaming,
     fetchSessions,
     createSession,
     sendMessage,

@@ -124,22 +124,39 @@ class TripleRetriever:
         # 2. 查询改写
         query_variants = await self.generate_query_variants(query)
 
-        # 3. 三路并行检索
-        # 3.1 向量：批量 embedding + 并发 Qdrant 搜索（4变体并发，节省 3×embedding 耗时）
-        vector_results = await self._vector_search_batch(query_variants, top_k)
+        # 3. 三路真并发检索
+        # 原来是 vector → bm25 → kg 依次 await，三路串行；现在合成一个 gather，
+        # 总耗时从「三路之和」降到「最慢一路」。每路内部仍按变体并发。
+        async def _bm25_all() -> List[Dict[str, Any]]:
+            nested = await asyncio.gather(*[
+                asyncio.to_thread(self.bm25_search, v, top_k) for v in query_variants
+            ])
+            return [r for sub in nested for r in sub]
 
-        # 3.2 BM25：in-memory 倒排索引，已经很快，仍并行起 4 个变体
-        bm25_results = await asyncio.gather(*[
-            asyncio.to_thread(self.bm25_search, v, top_k)
-            for v in query_variants
-        ])
-        bm25_results = [r for sub in bm25_results for r in sub]
+        async def _kg_all() -> List[Dict[str, Any]]:
+            nested = await asyncio.gather(*[
+                self.kg_search(v, top_k) for v in query_variants
+            ])
+            return [r for sub in nested for r in sub]
 
-        # 3.3 KG：每变体独立查询
-        kg_results = await asyncio.gather(*[
-            self.kg_search(v, top_k) for v in query_variants
-        ])
-        kg_results = [r for sub in kg_results for r in sub]
+        # return_exceptions 保证单路挂掉不拖垮另外两路（合并成一个 gather 后
+        # 如果不加这个，任意一路抛异常会让整次检索失败，比原来串行时更脆）
+        vector_results, bm25_results, kg_results = await asyncio.gather(
+            self._vector_search_batch(query_variants, top_k),
+            _bm25_all(),
+            _kg_all(),
+            return_exceptions=True,
+        )
+
+        route_names = ("vector", "bm25", "kg")
+        routes = []
+        for name, result in zip(route_names, (vector_results, bm25_results, kg_results)):
+            if isinstance(result, Exception):
+                print(f"⚠️ {name} 路检索失败，本次跳过该路: {result}")
+                routes.append([])
+            else:
+                routes.append(result)
+        vector_results, bm25_results, kg_results = routes
 
         # 4. 去重
         vector_results = self.deduplicate(vector_results)

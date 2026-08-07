@@ -176,14 +176,57 @@ def chunk_document(content: str, max_chunk_len: int = 600, similarity_threshold:
             "metadata": {"level": "semantic", "split_method": "cosine_drop"}
         }
 
+    # 工具函数：合并 PDF 碎片化行
+    # PyPDF2 抽出来的文本特点：
+    #   1. 单 \n 是 PDF 视觉换行（一个句子被切成多行）
+    #   2. \n\n 是真正的段落/页面分隔
+    #   3. 每页顶部重复页眉："XXX公司2025年年度报告全文 12"
+    # 直接按 \n 分句会得到 14000+ 条噪声句。正确做法：
+    #   - 只按 \n\n 切段落（PDF 一页一段）
+    #   - 段内单 \n 折成空串（合并视觉换行）
+    #   - 去掉重复的页眉/页码噪声
+    def _merge_frag_lines(text: str) -> str:
+        # 1. 先按行剥页眉/页脚噪声（仅删行本身，保留 \n\n 边界）
+        cleaned_lines = []
+        for line in text.split("\n"):
+            s = line.strip()
+            # 匹配页眉："报告全文12"（标题 + 页码同行）
+            if re.match(r"^.{4,40}?(年度报告全文|年报全文)\s*\d+\s*$", s):
+                continue
+            # 匹配纯页眉：只有"报告全文"无页码（页码可能在下一行）
+            if re.match(r"^.{4,40}?(年度报告全文|年报全文)\s*$", s):
+                continue
+            # 匹配纯页码 / 空白
+            if not s or re.match(r"^\d{1,4}$", s):
+                continue
+            cleaned_lines.append(line)
+        text = "\n".join(cleaned_lines)
+
+        # 2. 按 \n\n 切成段（PDF 页面分隔）
+        paras = text.split("\n\n")
+        merged_paras = []
+        for p in paras:
+            # 段内所有单 \n 折成空串（合并视觉换行）
+            collapsed = re.sub(r"\s*\n\s*", "", p).strip()
+            collapsed = re.sub(r"[ \t]+", " ", collapsed)
+            if collapsed and len(collapsed) >= 10:
+                merged_paras.append(collapsed)
+        return "\n\n".join(merged_paras)
+
     # 短文本直接返回
     text = content.strip()
     if len(text) <= max_chunk_len:
         return [_wrap(text)] if text else []
 
-    # 1. 句子级切分（中英文句末标点 + 换行）
-    raw_sentences = re.split(r'(?<=[。！？；\n.!?])\s*', text)
-    sentences = [s.strip() for s in raw_sentences if s.strip()]
+    # 0. 先合并 PDF 碎片行
+    text = _merge_frag_lines(text)
+    if len(text) <= max_chunk_len:
+        return [_wrap(text)] if text else []
+
+    # 1. 句子级切分（中英文句末标点；不再按 \n 切，由 _merge_frag_lines 处理过段落边界）
+    raw_sentences = re.split(r'(?<=[。！？；.!?])\s*', text)
+    # 过滤过短噪声（页码、单字等残留）
+    sentences = [s.strip() for s in raw_sentences if len(s.strip()) >= 8]
 
     # 2. 太短（句子数 < 窗口+1）不切
     if len(sentences) <= window + 1:
@@ -226,20 +269,26 @@ async def _semantic_chunk_async(sentences, max_chunk_len, threshold, window, _ha
     # embs 是 list[list[float]]，转 numpy 加速计算
     embs_arr = np.array(embs, dtype=np.float32)  # (N, dim)
 
-    # 2. 计算相邻 N 句的局部平均余弦相似度
+    # 2. 计算相邻 N 句的局部平均余弦相似度（向量化矩阵运算，O(N²) 一次性算出）
     n = len(sentences)
-    sims = []
-    for i in range(n - 1):
-        # 跟 [i-window, i+window] 范围（不含自身）的句子算相似度
-        neighbors = []
-        for j in range(max(0, i - window), min(n, i + window + 1)):
-            if j != i:
-                a = embs_arr[i]
-                b = embs_arr[j]
-                norm = np.linalg.norm(a) * np.linalg.norm(b)
-                if norm > 0:
-                    neighbors.append(float(np.dot(a, b) / norm))
-        sims.append(sum(neighbors) / len(neighbors) if neighbors else 1.0)
+    norms = np.linalg.norm(embs_arr, axis=1, keepdims=True)
+    normalized = embs_arr / (norms + 1e-9)
+    sim_matrix = normalized @ normalized.T  # (N, N)
+
+    # 构造邻居 mask：[i-window, i+window] 内（不含自身）
+    idx = np.arange(n)
+    mask = np.zeros((n, n), dtype=bool)
+    for offset in range(-window, window + 1):
+        if offset == 0:
+            continue
+        j = idx + offset
+        valid = (j >= 0) & (j < n)
+        mask[idx[valid], j[valid]] = True
+
+    # 每行的均值相似度（i = n-1 没用到，只取前 n-1）
+    neighbor_counts = mask.sum(axis=1)
+    sims = (sim_matrix * mask).sum(axis=1) / np.maximum(neighbor_counts, 1)
+    sims = sims[: n - 1].tolist()
 
     # 3. 找切点（相似度 < threshold）
     chunks_text: list = []

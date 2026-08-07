@@ -3,6 +3,7 @@
 """
 import networkx as nx
 import json
+import asyncio
 from typing import List, Dict, Any, Tuple
 import uuid
 
@@ -14,6 +15,9 @@ from ...config import settings
 # 单次送入 LLM 的文本块大小（字符）。超过则分块+滑窗拼接结果，确保不丢内容。
 LLM_CHUNK_SIZE = 1800
 LLM_CHUNK_OVERLAP = 200
+
+# KG 段落并发上限（同时向 LLM 发多少请求）。过高会触发限流/配额/超时。
+KG_PARALLEL_CONCURRENCY = 4
 
 
 def _split_for_llm(text: str, size: int = LLM_CHUNK_SIZE, overlap: int = LLM_CHUNK_OVERLAP) -> List[str]:
@@ -176,22 +180,34 @@ class KnowledgeGraphBuilder:
         - 跨文档同名实体在 DB 里是多行（每 doc 一行），由 API 层聚合成一个节点
         """
         # 分段处理
-        paragraphs = content.split("\n\n")
+        paragraphs = [p for p in content.split("\n\n") if len(p.strip()) >= 50]
+
+        # 段落级并发：每个段落独立走 extract_entities + extract_relations，
+        # 段内仍串行（关系依赖本段实体），跨段用 Semaphore 限流并发。
+        sem = asyncio.Semaphore(KG_PARALLEL_CONCURRENCY)
+
+        async def _process_one(para: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+            async with sem:
+                ents = await self.extract_entities(para)
+                rels: List[Dict[str, Any]] = []
+                if ents:
+                    rels = await self.extract_relations(para, ents)
+                return ents, rels
+
+        per_para_results = await asyncio.gather(
+            *(_process_one(p) for p in paragraphs),
+            return_exceptions=True,
+        )
+
         all_entities: List[Dict[str, Any]] = []
         all_relations: List[Dict[str, Any]] = []
-
-        for para in paragraphs:
-            if len(para.strip()) < 50:  # 跳过太短的段落
+        for i, r in enumerate(per_para_results):
+            if isinstance(r, Exception):
+                print(f"⚠️ 段落 {i} KG 抽取失败: {r}")
                 continue
-
-            # 提取实体（内部已按块抽取完整段落）
-            entities = await self.extract_entities(para)
-            all_entities.extend(entities)
-
-            # 提取关系
-            if entities:
-                relations = await self.extract_relations(para, entities)
-                all_relations.extend(relations)
+            ents, rels = r
+            all_entities.extend(ents)
+            all_relations.extend(rels)
 
         # 去重实体
         unique_entities: Dict[str, Dict[str, Any]] = {}

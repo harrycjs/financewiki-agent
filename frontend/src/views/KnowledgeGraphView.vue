@@ -27,9 +27,13 @@
       <div class="graph-section">
         <div class="section-header">
           <h3>知识图谱</h3>
-          <el-tag type="info">
-            {{ graphData.nodes.length }} 节点 / {{ graphData.edges.length }} 边
-          </el-tag>
+          <div style="display:flex; align-items:center; gap:8px;">
+            <span style="font-size:12px; color:#909399;">💡 点击节点展开一阶邻接</span>
+            <el-tag type="info">
+              显示 {{ graphData.nodes.length }} / {{ kgMeta.total_entities || '?' }} 节点 ·
+              {{ graphData.edges.length }} 边
+            </el-tag>
+          </div>
         </div>
         <div class="graph-canvas" ref="graphContainer"></div>
       </div>
@@ -105,7 +109,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, nextTick, watch } from 'vue'
+import { ref, onMounted } from 'vue'
 import { Search } from '@element-plus/icons-vue'
 import { Network } from 'vis-network'
 import { DataSet } from 'vis-data'
@@ -116,23 +120,45 @@ const filterType = ref('')
 const graphContainer = ref(null)
 const graphData = ref({ nodes: [], edges: [] })
 const stats = ref({})
+const kgMeta = ref({ core_limit: 200, hidden_entities: 0, total_entities: 0 })
 const selectedEntity = ref(null)
 const entityRelations = ref([])
+// 已展开的实体名（点击过的节点不再重复请求）
+const expandedNames = ref(new Set())
 let network = null
+let nodesDS = null
+let edgesDS = null
 
 onMounted(async () => {
   await fetchKGData()
   await fetchStats()
-  // 等待DOM更新后再初始化图
-  nextTick(() => {
-    initGraph()
+  // 等 flex 布局提交完成后再初始化 vis-network（nextTick 太早，容器可能还是 0×0）
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      initGraph()
+      // 监听容器尺寸变化（侧栏展开/窗口缩放/面板切换）—— vis-network 不会自动重算
+      if (graphContainer.value && 'ResizeObserver' in window) {
+        const ro = new ResizeObserver(() => {
+          if (network) network.redraw()
+        })
+        ro.observe(graphContainer.value)
+      }
+    })
   })
 })
 
 async function fetchKGData() {
   try {
     const response = await axios.get('/api/knowledge-graph')
-    graphData.value = response.data
+    graphData.value = {
+      nodes: response.data.nodes || [],
+      edges: response.data.edges || [],
+    }
+    kgMeta.value = {
+      core_limit: response.data.core_limit || 0,
+      hidden_entities: response.data.stats?.hidden_entities || 0,
+      total_entities: response.data.stats?.total_entities || 0,
+    }
     updateGraph()
   } catch (error) {
     console.error('获取知识图谱数据失败:', error)
@@ -151,8 +177,8 @@ async function fetchStats() {
 function initGraph() {
   if (!graphContainer.value) return
 
-  const nodes = new DataSet(formatNodes(graphData.value.nodes))
-  const edges = new DataSet(formatEdges(graphData.value.edges))
+  nodesDS = new DataSet(formatNodes(graphData.value.nodes))
+  edgesDS = new DataSet(formatEdges(graphData.value.edges))
 
   const options = {
     nodes: {
@@ -198,9 +224,9 @@ function initGraph() {
     }
   }
 
-  network = new Network(graphContainer.value, { nodes, edges }, options)
+  network = new Network(graphContainer.value, { nodes: nodesDS, edges: edgesDS }, options)
 
-  // 点击事件
+  // 点击事件：选实体详情 + 渐进展开一阶邻接
   network.on('click', async (params) => {
     if (params.nodes.length > 0) {
       const nodeId = params.nodes[0]
@@ -208,12 +234,35 @@ function initGraph() {
       if (node) {
         selectedEntity.value = node
         await fetchEntityRelations(node.name)
+        await expandNode(node)  // 渐进披露
       }
     } else {
       selectedEntity.value = null
       entityRelations.value = []
     }
   })
+}
+
+// 渐进披露：点击节点时拉取一阶邻接并合并到图
+async function expandNode(node) {
+  if (expandedNames.value.has(node.name)) return  // 已展开过，跳过
+  expandedNames.value.add(node.name)
+  try {
+    const resp = await axios.get(`/api/knowledge-graph/expand/${encodeURIComponent(node.name)}`)
+    const newNodes = (resp.data.nodes || []).filter(n => !nodesDS.get(n.id))
+    const newEdges = (resp.data.edges || []).filter(e => !edgesDS.get(e.id))
+    if (newNodes.length === 0 && newEdges.length === 0) return
+
+    // 合并到内存数据（保持 graphData.value 与 DataSet 一致）
+    graphData.value.nodes.push(...newNodes)
+    graphData.value.edges.push(...newEdges)
+    // 增量加入 DataSet，避免重置整个图导致物理引擎重新收敛
+    nodesDS.add(formatNodes(newNodes))
+    edgesDS.add(formatEdges(newEdges))
+  } catch (error) {
+    console.error('展开节点失败:', error)
+    expandedNames.value.delete(node.name)  // 失败回滚，避免下次误判已展开
+  }
 }
 
 function formatNodes(nodes) {
@@ -229,7 +278,8 @@ function formatNodes(nodes) {
     id: node.id,
     label: node.name,
     color: typeColors[node.type] || '#909399',
-    title: `${node.name} (${node.type})`
+    title: `${node.name} (${node.type})${node.expanded ? ' · 已展开' : ''}`,
+    borderWidth: node.expanded ? 3 : 2,
   }))
 }
 
@@ -244,10 +294,11 @@ function formatEdges(edges) {
 }
 
 function updateGraph() {
-  if (network) {
-    const nodes = new DataSet(formatNodes(graphData.value.nodes))
-    const edges = new DataSet(formatEdges(graphData.value.edges))
-    network.setData({ nodes, edges })
+  if (nodesDS && edgesDS) {
+    nodesDS.clear()
+    edgesDS.clear()
+    nodesDS.add(formatNodes(graphData.value.nodes))
+    edgesDS.add(formatEdges(graphData.value.edges))
   }
 }
 
@@ -354,8 +405,11 @@ function getEntityTypeColor(type) {
 
 .graph-canvas {
   flex: 1;
+  width: 100%;
+  height: 100%;
   min-height: 350px;
   background: #fafafa;
+  position: relative;
 }
 
 .info-panel {

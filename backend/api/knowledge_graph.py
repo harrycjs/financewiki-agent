@@ -16,6 +16,7 @@ from ..database import execute_query
 router = APIRouter(prefix="/api/knowledge-graph", tags=["knowledge-graph"])
 
 MAX_LIMIT = 5000  # 硬上限，防止一次性把全库拖死
+CORE_LIMIT = 200   # 渐进披露：默认仅返回度数最高的 200 个核心节点，其余按需展开
 
 
 def _merge_attributes(attr_list: List[dict]) -> dict:
@@ -27,9 +28,14 @@ def _merge_attributes(attr_list: List[dict]) -> dict:
     return merged
 
 
+def _node_id(name: str, type_: str) -> str:
+    """节点唯一 ID：同名不同型拆开（前端 vis-data 不允许重复 id）"""
+    return f"{name}|{type_}"
+
+
 @router.get("")
 async def get_knowledge_graph(
-    limit: int = Query(MAX_LIMIT, ge=1, le=MAX_LIMIT),
+    limit: int = Query(CORE_LIMIT, ge=1, le=MAX_LIMIT),
     doc_id: Optional[str] = Query(None, description="按文档过滤；不传则返回全局合并视图"),
 ):
     """获取知识图谱概览
@@ -92,13 +98,17 @@ async def get_knowledge_graph(
         return {"nodes": nodes, "edges": edges, "scope": "document", "doc_id": doc_id}
 
     # —— 全局视图：按 name/type 聚合 ——
+    # 渐进披露：默认仅取度数最高的 limit 个核心实体，避免一次返回几千节点把前端拖死
     raw_entities = execute_query(
-        """SELECT id, name, type, attributes, doc_id
+        """SELECT id, name, type, attributes, doc_id,
+                  (SELECT COUNT(*) FROM relations WHERE source_id = entities.id) +
+                  (SELECT COUNT(*) FROM relations WHERE target_id = entities.id) AS degree
            FROM entities
-           ORDER BY created_at DESC
+           ORDER BY degree DESC, name
            LIMIT ?""",
         (limit,)
     )
+    core_keys = {(e[1], e[2]) for e in raw_entities}  # 用于过滤边：只保留两端都在核心集里的边
 
     # 关系：先在 SQL 层按 (源实体名, 目标实体名, 关系类型, doc_id) 去重，
     # 避免因"每文档一个实体行"造成 JOIN 交叉乘 → occurrences 虚高
@@ -112,27 +122,31 @@ async def get_knowledge_graph(
                FROM relations r
                JOIN entities e1 ON r.source_id = e1.id
                JOIN entities e2 ON r.target_id = e2.id
+               WHERE e1.name || '|' || e1.type IN ({ph}) AND e2.name || '|' || e2.type IN ({ph})
            )
            GROUP BY source_name, target_name, relation, doc_id
            ORDER BY weight DESC
-           LIMIT ?""",
-        (limit * 2,)
-    )
+           LIMIT ?""".format(ph=", ".join("?" for _ in core_keys)),
+        (*[f"{k[0]}|{k[1]}" for k in core_keys], *[f"{k[0]}|{k[1]}" for k in core_keys], limit * 2)
+    ) if core_keys else []
 
-    # 节点聚合：key = (name, type)；节点 id 用 name 以便与边的 source/target 对齐
+    # 节点聚合：key = (name, type)；节点 id 必须全局唯一（同名不同型要拆开），
+    # 用 "name|type" 编码即可与边的 source/target 对齐
     node_map: Dict[tuple, Dict[str, Any]] = {}
     for e in raw_entities:
         key = (e[1], e[2])
         attr = json.loads(e[3]) if e[3] else {}
         if key not in node_map:
             node_map[key] = {
-                "id": e[1],  # 用 name 作前端 vis-network 的 node id（与边的 source/target 对齐）
+                "id": _node_id(e[1], e[2]),
                 "name": e[1],
                 "type": e[2],
                 "attributes": attr,
                 "doc_id": e[4],
                 "doc_ids": [],
                 "occurrences": 0,
+                "expanded": False,
+                "degree": e[5],
             }
         node = node_map[key]
         node["occurrences"] += 1
@@ -141,15 +155,18 @@ async def get_knowledge_graph(
         # 合并 attributes（后写覆盖前写）
         node["attributes"] = _merge_attributes([node["attributes"], attr])
 
-    # 边聚合：key = (source_name, target_name, relation)
+    # 边聚合：key = (source_name+type, target_name+type, relation)；source/target
+    # 编码成与节点 id 完全相同的 "name|type"，vis-network 才能对齐两端
     edge_map: Dict[tuple, Dict[str, Any]] = {}
     for r in raw_relations:
-        key = (r[0], r[2], r[4])  # source_name, target_name, relation
+        key = (r[0], r[1], r[2], r[3], r[4])  # source_name, source_type, target_name, target_type, relation
         if key not in edge_map:
+            src_id = _node_id(r[0], r[1])
+            tgt_id = _node_id(r[2], r[3])
             edge_map[key] = {
-                "id": f"agg-{r[0]}-{r[2]}-{r[4]}",  # 合成 id，供前端 vis-network 使用
-                "source": r[0],   # 前端 vis-network 用 source_name 作节点 id 即可
-                "target": r[2],
+                "id": f"agg-{r[0]}-{r[2]}-{r[4]}",
+                "source": src_id,
+                "target": tgt_id,
                 "source_name": r[0],
                 "source_type": r[1],
                 "target_name": r[2],
@@ -165,16 +182,121 @@ async def get_knowledge_graph(
         if r[6] and r[6] not in edge["doc_ids"]:
             edge["doc_ids"].append(r[6])
 
+    # 总数（用于前端告知用户"还有 N 个节点可展开"）
+    total_entities_row = execute_query("SELECT COUNT(*) FROM entities")
+    total_entities = total_entities_row[0][0] if total_entities_row else 0
+    total_relations_row = execute_query("SELECT COUNT(*) FROM relations")
+    total_relations = total_relations_row[0][0] if total_relations_row else 0
+
     return {
         "nodes": list(node_map.values()),
         "edges": list(edge_map.values()),
-        "scope": "global",
+        "scope": "core",
+        "core_limit": limit,
         "stats": {
-            "merged_nodes": len(node_map),
-            "merged_edges": len(edge_map),
-            "raw_entities_scanned": len(raw_entities),
-            "raw_relations_scanned": len(raw_relations),
+            "core_nodes": len(node_map),
+            "core_edges": len(edge_map),
+            "total_entities": total_entities,
+            "total_relations": total_relations,
+            "hidden_entities": max(0, total_entities - len(node_map)),
         },
+    }
+
+
+@router.get("/expand/{name}")
+async def expand_neighbors(name: str):
+    """渐进披露：点击节点时拉取该实体的一阶邻接子图。
+
+    返回：
+    - 目标实体本身（同名多型则全部返回）
+    - 一阶邻居实体（通过任一关系与之相连的实体）
+    - 这些实体之间的所有边
+
+    设计：每个实体行带 `expanded: true` 标记，便于前端区分"初始核心"与"按需展开"。
+    """
+    # 1. 找到该 name 的所有实体行（同名可能多 type）
+    seed_rows = execute_query(
+        """SELECT id, name, type, attributes, doc_id
+           FROM entities WHERE name = ?""",
+        (name,)
+    )
+    if not seed_rows:
+        seed_rows = execute_query(
+            """SELECT id, name, type, attributes, doc_id
+               FROM entities WHERE name LIKE ? LIMIT 10""",
+            (f"%{name}%",)
+        )
+    if not seed_rows:
+        raise HTTPException(status_code=404, detail="实体不存在")
+
+    seed_ids = [r[0] for r in seed_rows]
+
+    # 2. 邻居：与 seed 任一 id 通过关系相连的实体（去重）
+    placeholders = ", ".join("?" for _ in seed_ids)
+    neighbor_rows = execute_query(
+        f"""SELECT DISTINCT e.id, e.name, e.type, e.attributes, e.doc_id
+            FROM entities e
+            WHERE e.id IN (
+                SELECT CASE WHEN r.source_id IN ({placeholders}) THEN r.target_id ELSE r.source_id END
+                FROM relations r
+                WHERE r.source_id IN ({placeholders}) OR r.target_id IN ({placeholders})
+            )""",
+        (*seed_ids, *seed_ids, *seed_ids)
+    )
+
+    # 3. 合并 seed + neighbor，标记 expanded
+    all_entity_rows = {r[0]: r for r in (*seed_rows, *neighbor_rows)}
+    nodes = []
+    for eid, e in all_entity_rows.items():
+        nodes.append({
+            "id": _node_id(e[1], e[2]),
+            "name": e[1],
+            "type": e[2],
+            "attributes": json.loads(e[3]) if e[3] else {},
+            "doc_id": e[4],
+            "doc_ids": [e[4]] if e[4] else [],
+            "expanded": eid in set(seed_ids),
+        })
+
+    # 4. 边：所有两端都在 {seed ∪ neighbor} 集合内的关系
+    all_ids = list(all_entity_rows.keys())
+    placeholders2 = ", ".join("?" for _ in all_ids)
+    edge_rows = execute_query(
+        f"""SELECT e1.name AS source_name, e1.type AS source_type,
+                   e2.name AS target_name, e2.type AS target_type,
+                   r.relation, MAX(r.weight) AS weight
+            FROM relations r
+            JOIN entities e1 ON r.source_id = e1.id
+            JOIN entities e2 ON r.target_id = e2.id
+            WHERE r.source_id IN ({placeholders2}) AND r.target_id IN ({placeholders2})
+            GROUP BY source_name, source_type, target_name, target_type, relation""",
+        (*all_ids, *all_ids)
+    ) if all_ids else []
+
+    edges = []
+    seen = set()
+    for r in edge_rows:
+        key = (r[0], r[2], r[4])
+        if key in seen:
+            continue
+        seen.add(key)
+        edges.append({
+            "id": f"exp-{r[0]}-{r[2]}-{r[4]}",
+            "source": _node_id(r[0], r[1]),
+            "target": _node_id(r[2], r[3]),
+            "source_name": r[0],
+            "source_type": r[1],
+            "target_name": r[2],
+            "target_type": r[3],
+            "relation": r[4],
+            "weight": float(r[5]),
+        })
+
+    return {
+        "seed": name,
+        "nodes": nodes,
+        "edges": edges,
+        "scope": "expand",
     }
 
 

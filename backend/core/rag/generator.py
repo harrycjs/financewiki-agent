@@ -1,10 +1,12 @@
 """
 响应生成器
 """
-from typing import List, Dict, Any, Optional
+import json
+from typing import List, Dict, Any, AsyncGenerator, Optional
 
 from ..llm.base import BaseLLM
 from ..memory.compressor import ConversationCompressor
+from ..tools import get_registry
 from ...config import settings
 from .skill_resolver import get_resolver
 
@@ -65,7 +67,11 @@ class ResponseGenerator:
         if full_text:
             skills_block += f"\n\n## 当前已加载技能\n{full_text}"
 
-        return BASE_SYSTEM_PROMPT + skills_block
+        # 工具清单：schema 通过原生 tools 参数传，这里再给一份可读说明
+        # 让模型清楚「什么时候该用哪个」
+        tools_block = get_registry().prompt_block()
+
+        return BASE_SYSTEM_PROMPT + skills_block + tools_block
 
     async def generate(
         self,
@@ -89,12 +95,109 @@ class ResponseGenerator:
         context: Any,
         documents: List[Dict[str, Any]]
     ):
-        """流式生成回答"""
+        """流式生成回答（不带工具，保留给不需要 agent 能力的调用方）"""
         llm = self._get_llm()
         messages = self._build_messages(query, context, documents)
 
         async for chunk in llm.stream_chat(messages):
             yield chunk
+
+    async def run_agent_stream(
+        self,
+        query: str,
+        context: Any,
+        documents: List[Dict[str, Any]],
+        max_steps: Optional[int] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """带工具循环的流式生成——这是 /api/chat 的主路径。
+
+        每一轮：流式产出模型文本 → 若模型请求工具则执行并把结果回灌 → 再来一轮，
+        直到模型不再要工具，或达到 max_steps 上限。
+
+        产出事件：
+          {"type": "delta",       "content": str}              增量文本
+          {"type": "tool_call",   "name": str, "arguments": dict}
+          {"type": "tool_result", "name": str, "preview": str, "ok": bool}
+          {"type": "final",       "content": str, "used_tools": bool}
+        """
+        llm = self._get_llm()
+        registry = get_registry()
+        messages = self._build_messages(query, context, documents)
+        tools = registry.schemas()
+
+        limit = max_steps if max_steps is not None else settings.AGENT_MAX_STEPS
+        collected: List[str] = []
+        used_tools = False
+
+        for step in range(limit + 1):
+            # 最后一轮不再给工具，逼模型基于已有信息收尾
+            offer_tools = tools if step < limit else None
+
+            text_parts: List[str] = []
+            tool_calls: List[Dict[str, str]] = []
+
+            async for event in llm.stream_agent(messages, tools=offer_tools):
+                if event["type"] == "text":
+                    text_parts.append(event["content"])
+                    yield {"type": "delta", "content": event["content"]}
+                elif event["type"] == "tool_calls":
+                    tool_calls = event["tool_calls"]
+
+            assistant_text = "".join(text_parts)
+            if assistant_text:
+                collected.append(assistant_text)
+
+            if not tool_calls:
+                break
+
+            used_tools = True
+            messages.append({
+                "role": "assistant",
+                "content": assistant_text or None,
+                "tool_calls": [
+                    {
+                        "id": call["id"],
+                        "type": "function",
+                        "function": {
+                            "name": call["name"],
+                            "arguments": call["arguments"] or "{}",
+                        },
+                    }
+                    for call in tool_calls
+                ],
+            })
+
+            for call in tool_calls:
+                name = call["name"]
+                try:
+                    arguments = json.loads(call["arguments"] or "{}")
+                except json.JSONDecodeError:
+                    arguments = {}
+                    result = (
+                        f"错误：参数不是合法 JSON，收到的是 {call['arguments'][:200]!r}。"
+                        f"请重新调用并给出合法的 JSON 参数。"
+                    )
+                else:
+                    yield {"type": "tool_call", "name": name, "arguments": arguments}
+                    result = await registry.execute(name, arguments)
+
+                yield {
+                    "type": "tool_result",
+                    "name": name,
+                    "preview": result[:200],
+                    "ok": not result.startswith("错误："),
+                }
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call["id"],
+                    "content": result,
+                })
+
+        yield {
+            "type": "final",
+            "content": "\n\n".join(p for p in collected if p).strip(),
+            "used_tools": used_tools,
+        }
 
     def _build_messages(
         self,

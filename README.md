@@ -44,7 +44,9 @@
 ### 📊 知识图谱
 - 上传文档自动抽取实体（公司/指标/人物/行业/概念）
 - 跨文档同名实体自动合并为单一节点
-- vis-network 力导向图可视化
+- **节点 ID 编码 `name|type`** —— 同名不同型（例 "信息技术" 既属行业也属概念）拆为不同节点，避免 vis-data ID 冲突
+- **渐进披露（前端按需展开）**：默认仅渲染 top-200 度数核心节点，点击节点 → 异步 `/expand/{name}` 拉一阶邻接 → 增量 merge 到 vis-network DataSet；不再一次性拖出 1449 节点卡死前端
+- vis-network 力导向图可视化（物理引擎）
 
 ### 🤖 多模型支持
 智谱 GLM-4 · DeepSeek · Kimi · MiniMax
@@ -322,7 +324,7 @@ enabled: true
 | 对话 | `POST /api/chat`（流式）, `GET /api/chat/history`, `GET/POST/DELETE /api/chat/sessions`, `POST /api/chat/sessions/recover-orphans` |
 | 记忆 | `GET /api/chat/memory/stats`（三层记忆运行状态 + 可选 `?session_id=...`） |
 | 文档 | `POST /api/documents/upload`, `GET /api/documents`, `DELETE /api/documents/{id}`, `POST /api/documents/{id}/reprocess` |
-| 知识图谱 | `GET /api/knowledge-graph`（全局合并视图）, `GET /api/knowledge-graph/stats`, `GET /api/knowledge-graph/entity/{name}` |
+| 知识图谱 | `GET /api/knowledge-graph`（默认 top-200 度数核心视图）, `GET /api/knowledge-graph/expand/{name}`（一阶邻接按需展开）, `GET /api/knowledge-graph/stats`, `GET /api/knowledge-graph/entity/{name}`, `GET /api/knowledge-graph/search` |
 | 模型 | `GET /api/models`, `POST /api/models/switch`, `POST /api/models/config/{provider}`, `POST /api/models/test/{provider}` |
 | 技能 | `GET /api/skills`, `GET/POST/PUT/DELETE /api/skills/{name}`, `POST /api/skills/{name}/toggle`, `POST /api/skills/{name}/test`, `POST /api/skills/reload` |
 
@@ -384,6 +386,27 @@ COMPRESSION_LLM_TEMPERATURE = 0.2
 
 ---
 
+## ⚡ 文档上传与处理优化
+
+针对 166 页 / 188K 字符的年报类 PDF，端到端上传链路做了 4 层优化（P0→P3）：
+
+| 级别 | 改动 | 文件 | 效果 |
+|---|---|---|---|
+| **P0 解耦** | 上传接口 `asyncio.create_task` fire-and-forget 队列处理 | `backend/queue/producer.py:67` | HTTP 立即返回 200，前端不再转圈 |
+| **P1 PDF 碎片修复** | PyPDF2 输出按视觉行切，单 `\n` 是断行不是段落。`_merge_frag_lines()` 按 `\n\n` 切段、段内单 `\n` 折叠、剥页眉/页码噪声 | `backend/queue/worker.py:188` | 14K 噪声句 → ~1K 真实句 |
+| **P2 相似度矩阵向量化** | `_semantic_chunk_async` 中 Python 双层 for-loop 改 numpy matmul 一次性算 (N×N) | `backend/queue/worker.py:272` | O(N×window) Python 循环 → 一次矩阵乘法 |
+| **P3 KG 段落并发** | `build_from_document` 段落级 `asyncio.gather` + `Semaphore(4)`，每段独立走 extract_entities + extract_relations | `backend/core/knowledge_graph/builder.py:175` | N 段落串行 → 4 路并发 |
+
+**分块算法**（`worker.chunk_document`）：
+- PDF 碎片行合并 → 句子级切分（`(?<=[。！？；.!?])\s*`，过滤 < 8 字符噪声）→ 批量 embedding（`batch_size=32`，带缓存）→ 滑动窗口 + 余弦相似度落差检测 → 硬切兜底
+
+**降级链**（任一步挂掉都不卡死）：
+- 同步路径下无事件循环 → `_fallback_chunk`（按句子级累计硬切）
+- embedding 模型加载失败 → LLM 抽取静默跳过
+- 任一异步 gather 异常 → `return_exceptions=True` 仅跳过该路
+
+---
+
 ## 🧠 设计要点
 
 - **三层记忆真正可召回**：每一层都有独立的存储、独立的检索路径、独立的降级链
@@ -392,7 +415,7 @@ COMPRESSION_LLM_TEMPERATURE = 0.2
 - **单例化**：MemoryManager 进程级单例，Redis 连接与向量库实例全局共享，避免 per-request 实例化丢数据
 - **per-session 锁**：并发请求同一会话不会重复压缩
 - **压缩有损可控**：锚点 3 轮原文 + 结构化 JSON 摘要（数字/代码/日期/实体专门保留）
-- **渐进式披露**：技能按需注入，token 占用与技能数量解耦
+- **渐进式披露**：技能按需注入，token 占用与技能数量解耦；KG 也按需展开，按度数排序的 top-200 核心 + 点击异步拉一阶邻接
 - **真正的增量**：DB 中每个文档独立存储实体/关系，API 层按 (name, type) 合并为全局图
 - **流式优先**：对话用 SSE 流式输出，前端 fetch + ReadableStream 解析
 - **离线友好**：Redis 不可用时自动降级到内存模式；Qdrant 不可用时同样

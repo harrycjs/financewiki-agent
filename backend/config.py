@@ -4,7 +4,7 @@
 import os
 from pathlib import Path
 from pydantic_settings import BaseSettings
-from typing import Optional
+from typing import List, Optional
 
 
 class Settings(BaseSettings):
@@ -85,6 +85,30 @@ class Settings(BaseSettings):
     COMPRESSION_SUMMARY_MAX_TOKENS: int = 2000
     COMPRESSION_LLM_TEMPERATURE: float = 0.2
 
+    # ==================== Agent 工具 ====================
+    # 工具沙箱根目录（多根）：
+    # - WORKSPACE_ROOT：用户文件沙箱，bash 默认 cwd，新文件写到这
+    # - SKILLS_ROOT：技能目录；skill-creator 等的 scripts/ 必须可读可执行，
+    #                agent 创建新 skill 时也要能写到这里
+    WORKSPACE_ROOT: str = "./data/workspace"
+    SKILLS_ROOT: str = "./backend/skills"
+    AGENT_MAX_STEPS: int = 8         # 工具循环最大轮数，防止 LLM 打转烧 token
+    BASH_TIMEOUT: int = 30           # bash 单条命令超时（秒）
+    BASH_MAX_OUTPUT: int = 8000      # bash / read_file 回灌给 LLM 的最大字符数
+    TAVILY_API_KEY: Optional[str] = None
+    TAVILY_API_BASE: str = "https://api.tavily.com"
+
+    @property
+    def allowed_roots(self) -> List[Path]:
+        """工具沙箱允许的根目录列表。所有 read/write 都必须落在其中之一内。"""
+        roots: List[Path] = []
+        for p in (self.WORKSPACE_ROOT, self.SKILLS_ROOT):
+            try:
+                roots.append(Path(p).resolve())
+            except Exception:
+                pass
+        return roots
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
@@ -97,4 +121,6 @@ settings = Settings()
 Path(settings.SQLITE_DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 Path("./data/documents").mkdir(parents=True, exist_ok=True)
 Path("./data/knowledge_graph").mkdir(parents=True, exist_ok=True)
+Path(settings.WORKSPACE_ROOT).mkdir(parents=True, exist_ok=True)
+Path(settings.SKILLS_ROOT).mkdir(parents=True, exist_ok=True)
 Path("./logs").mkdir(parents=True, exist_ok=True)

@@ -59,11 +59,12 @@ class QueueProducer:
         }
 
         if self.use_memory:
-            # 内存模式 - 直接处理
+            # 内存模式 - fire-and-forget，绝不能 await 阻塞 HTTP 请求
+            # 否则前端会一直转圈圈直到全部处理完（embedding + KG 串行耗时几分钟到几小时）
             print(f"📤 文档任务入队(内存模式): {doc_id} (内容长度: {len(content)})")
-            # 在内存模式下，直接同步处理
+            import asyncio
             from .worker import document_handler
-            await document_handler(task)
+            asyncio.create_task(document_handler(task))
         else:
             await self.redis.rpush(self.queues["document"], json.dumps(task))
             print(f"📤 文档任务入队: {doc_id} (内容长度: {len(content)})")

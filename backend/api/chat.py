@@ -133,16 +133,11 @@ async def chat(request: ChatRequest):
         memory.schedule_write(session_id, request.message, answer, sources)
 
         async def cached_stream():
-            yield json.dumps({
-                "type": "session_id",
-                "session_id": session_id
-            })
+            yield json.dumps({"type": "session_id", "session_id": session_id})
             yield "\n"
-            yield json.dumps({
-                "type": "content",
-                "content": answer,
-                "sources": sources
-            })
+            yield json.dumps({"type": "delta", "content": answer})
+            yield "\n"
+            yield json.dumps({"type": "done", "sources": sources, "cached": True})
             yield "\n"
 
         return StreamingResponse(cached_stream(), media_type="text/event-stream")
@@ -154,49 +149,82 @@ async def chat(request: ChatRequest):
     # 组装三层记忆上下文（内含 95% 安全阀同步压缩）
     context_block = await memory.assemble_context(session_id, request.message)
 
-    # 生成回答
     generator = ResponseGenerator()
-    answer = await generator.generate(
-        query=request.message,
-        context=context_block,
-        documents=results
-    )
-
     sources = [r.get("id") for r in results if r.get("id")]
 
-    # 缓存结果
-    await cache.set_query_cache(
-        request.message,
-        model_name,
-        request.top_k,
-        {
-            "answer": answer,
-            "sources": sources
-        },
-        skills_sig
-    )
+    async def agent_stream():
+        """真流式：边生成边下发，工具调用同步暴露给前端
 
-    # 保存到数据库（source of truth，同步写）
-    _write_chat_history(session_id, request.message, answer, sources)
+        落库放在 finally 里——客户端中途断开时（GeneratorExit）也能把已生成的
+        部分答案存下来，不至于历史里出现一条只有提问没有回答的记录。
+        """
+        answer = ""
+        used_tools = False
 
-    # 三层记忆写入 + 80% 后台压缩检查，fire-and-forget 不阻塞回复
-    memory.schedule_write(session_id, request.message, answer, sources)
-
-    # 流式输出
-    async def stream_response():
-        yield json.dumps({
-            "type": "session_id",
-            "session_id": session_id
-        })
-        yield "\n"
-        yield json.dumps({
-            "type": "content",
-            "content": answer,
-            "sources": sources
-        })
+        yield json.dumps({"type": "session_id", "session_id": session_id})
         yield "\n"
 
-    return StreamingResponse(stream_response(), media_type="text/event-stream")
+        try:
+            async for event in generator.run_agent_stream(
+                query=request.message,
+                context=context_block,
+                documents=results,
+            ):
+                kind = event["type"]
+                if kind == "delta":
+                    yield json.dumps({"type": "delta", "content": event["content"]})
+                    yield "\n"
+                elif kind == "tool_call":
+                    yield json.dumps({
+                        "type": "tool_call",
+                        "name": event["name"],
+                        "arguments": event["arguments"],
+                    })
+                    yield "\n"
+                elif kind == "tool_result":
+                    yield json.dumps({
+                        "type": "tool_result",
+                        "name": event["name"],
+                        "preview": event["preview"],
+                        "ok": event["ok"],
+                    })
+                    yield "\n"
+                elif kind == "final":
+                    answer = event["content"]
+                    used_tools = event["used_tools"]
+
+            yield json.dumps({"type": "done", "sources": sources})
+            yield "\n"
+
+        except Exception as e:
+            print(f"⚠️ agent 流式生成失败: {type(e).__name__}: {e}")
+            yield json.dumps({"type": "error", "message": f"{type(e).__name__}: {e}"})
+            yield "\n"
+
+        finally:
+            if answer:
+                _write_chat_history(session_id, request.message, answer, sources)
+                memory.schedule_write(session_id, request.message, answer, sources)
+                # 调过工具的回答不进缓存：搜索结果、文件内容都是时效性的，
+                # 缓存下来下次命中会返回过期信息
+                if not used_tools:
+                    await cache.set_query_cache(
+                        request.message,
+                        model_name,
+                        request.top_k,
+                        {"answer": answer, "sources": sources},
+                        skills_sig,
+                    )
+            # agent 可能用 bash 在 skills 目录里新建/修改了技能；
+            # scanner 有缓存，下一轮对话必须重新扫描才能看到
+            if used_tools:
+                try:
+                    from ..core.skills.scanner import get_scanner
+                    get_scanner().invalidate_cache()
+                except Exception as e:
+                    print(f"⚠️ 扫描器缓存失效失败: {e}")
+
+    return StreamingResponse(agent_stream(), media_type="text/event-stream")
 
 
 @router.get("/history")
